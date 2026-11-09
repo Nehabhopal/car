@@ -1,0 +1,20 @@
+# Large raw clips and scratch files
+*.zip
+*.zip.zip
+*.mp4
+clip 1 frame.zip/
+clip 2 frame.zip/
+clip 3 frame.zip/
+flow clip frame.zip/
+car image_files/
+k1_files/
+car image.html
+k1.html
+*.jpeg
+Porsche 911 in the Midnight Fog.png
+
+# Keep project scripts
+powershell.cmd
+check_*.ps1
+inspect_*.py
+convert_*.py
