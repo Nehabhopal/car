@@ -40,7 +40,7 @@
 
     let lastTime = 0;
     function render(now) {
-      if (now - lastTime > 125) { // 8 shifts per second
+      if (now - lastTime > 125) { // ~8 shifts per second
         lastTime = now;
         createNoise();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -95,7 +95,7 @@
   }
 
   // --------------------------------------------------------------------------
-  // 3. FRAME SCRUBBER ENGINE (CANVAS + PRELOADING + NEAREST FALLBACK)
+  // 3. HIGH-PERFORMANCE FRAME SCRUBBER ENGINE
   // --------------------------------------------------------------------------
   class FrameScrubber {
     constructor(canvasId, wrapperId, frameCount, getPathFn) {
@@ -112,26 +112,55 @@
     }
 
     loadFrame(index) {
+      if (index < 0 || index >= this.frameCount) return Promise.resolve(null);
       if (this.images[index]) return Promise.resolve(this.images[index]);
+
       const img = new Image();
       img.src = `${this.getPathFn()}${String(index + 1).padStart(4, '0')}.webp`;
       this.images[index] = img;
+
+      img.onload = () => {
+        const curr = Math.round(this.currentFrame);
+        if (this.lastDrawn === -1 || Math.abs(curr - index) <= 1) {
+          this.draw(curr);
+        }
+      };
+
       if (img.decode) {
         return img.decode().then(() => img).catch(() => img);
       }
       return Promise.resolve(img);
     }
 
+    preloadNear(index, range = 20) {
+      const start = Math.max(0, index - 5);
+      const end = Math.min(this.frameCount - 1, index + range);
+      for (let i = start; i <= end; i++) {
+        if (!this.images[i]) {
+          this.loadFrame(i);
+        }
+      }
+    }
+
     resize() {
       const rect = this.canvas.getBoundingClientRect();
-      this.canvas.width = rect.width * this.dpr;
-      this.canvas.height = rect.height * this.dpr;
+      const w = rect.width > 0 ? rect.width : window.innerWidth;
+      const h = rect.height > 0 ? rect.height : window.innerHeight;
+      this.canvas.width = Math.round(w * this.dpr);
+      this.canvas.height = Math.round(h * this.dpr);
       this.lastDrawn = -1; // force redraw
+      this.draw(Math.round(this.currentFrame));
     }
 
     draw(frameIdx) {
+      if (frameIdx < 0 || frameIdx >= this.frameCount) return;
+
+      // On-demand priority window around current scrub position
+      this.preloadNear(frameIdx, 25);
+
       let img = this.images[frameIdx];
-      // Nearest loaded fallback
+
+      // Nearest loaded fallback if target frame hasn't finished decoding
       if (!img || !img.complete || img.naturalWidth === 0) {
         for (let off = 1; off < this.frameCount; off++) {
           const prev = this.images[frameIdx - off];
@@ -146,15 +175,18 @@
           }
         }
       }
+
       if (!img || !img.complete || img.naturalWidth === 0) return;
 
       const cw = this.canvas.width;
       const ch = this.canvas.height;
+      if (cw === 0 || ch === 0) return;
+
       const iw = img.naturalWidth;
       const ih = img.naturalHeight;
       const isPortrait = ch > cw;
 
-      // Solid background
+      // Pure solid background
       this.ctx.fillStyle = '#07080A';
       this.ctx.fillRect(0, 0, cw, ch);
 
@@ -167,7 +199,7 @@
         dx = (cw - dw) / 2;
         dy = (ch - dh) / 2;
       } else {
-        // Portrait: contain-fit vertically centered so car is never cropped
+        // Portrait: contain-fit, centered vertically on --asphalt
         const scale = Math.min(cw / iw, ch / ih);
         dw = iw * scale;
         dh = ih * scale;
@@ -190,7 +222,25 @@
   }
 
   // --------------------------------------------------------------------------
-  // 4. MAIN LIFECYCLE
+  // 4. PARALLEL BACKGROUND STREAMER
+  // --------------------------------------------------------------------------
+  async function streamAllFrames(scrubber, start, end, concurrency = 6) {
+    let nextIdx = start;
+    async function worker() {
+      while (nextIdx < end) {
+        const idx = nextIdx++;
+        await scrubber.loadFrame(idx);
+      }
+    }
+    const workers = [];
+    for (let c = 0; c < concurrency; c++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+  }
+
+  // --------------------------------------------------------------------------
+  // 5. MAIN LIFECYCLE & ORCHESTRATION
   // --------------------------------------------------------------------------
   document.addEventListener('DOMContentLoaded', async () => {
     initGrain();
@@ -209,32 +259,47 @@
     window.addEventListener('resize', onResize, { passive: true });
     onResize();
 
-    // PRELOADER: LOAD FRAMES 1–40 FIRST
+    // ------------------------------------------------------------------------
+    // PRELOADER: LOAD PRIORITY FRAMES FOR BOTH HERO & DISMANTLE IN PARALLEL
+    // ------------------------------------------------------------------------
+    const heroPriority = Math.min(30, cfg.heroFrameCount);
+    const dismantlePriority = Math.min(25, cfg.dismantleFrameCount);
+    const totalPriority = heroPriority + dismantlePriority;
+
     const bar = document.getElementById('preloader-bar');
     const countEl = document.getElementById('preloader-count');
-    const priorityCount = Math.min(40, cfg.heroFrameCount);
+    let loadedPriority = 0;
 
-    for (let i = 0; i < priorityCount; i++) {
-      await heroScrubber.loadFrame(i);
-      const pct = Math.round(((i + 1) / priorityCount) * 100);
-      bar.style.width = `${pct}%`;
-      countEl.textContent = String(pct).padStart(3, '0');
+    function onPriorityFrameLoaded() {
+      loadedPriority++;
+      const pct = Math.min(100, Math.round((loadedPriority / totalPriority) * 100));
+      if (bar) bar.style.width = `${pct}%`;
+      if (countEl) countEl.textContent = String(pct).padStart(3, '0');
     }
 
-    bar.classList.add('flash');
+    const priorityPromises = [];
+    for (let i = 0; i < heroPriority; i++) {
+      priorityPromises.push(heroScrubber.loadFrame(i).then(onPriorityFrameLoaded));
+    }
+    for (let i = 0; i < dismantlePriority; i++) {
+      priorityPromises.push(dismantleScrubber.loadFrame(i).then(onPriorityFrameLoaded));
+    }
+
+    await Promise.all(priorityPromises);
+
+    // Initial render of both stages!
+    heroScrubber.draw(0);
+    dismantleScrubber.draw(0);
+
+    if (bar) bar.classList.add('flash');
     setTimeout(() => {
       document.body.classList.remove('is-loading');
       heroScrubber.draw(0);
+      dismantleScrubber.draw(0);
 
-      // Async background load of rest of hero, then dismantle
-      (async function backgroundLoad() {
-        for (let i = priorityCount; i < cfg.heroFrameCount; i++) {
-          await heroScrubber.loadFrame(i);
-        }
-        for (let i = 0; i < cfg.dismantleFrameCount; i++) {
-          await dismantleScrubber.loadFrame(i);
-        }
-      })();
+      // Background parallel streaming for remaining frames
+      streamAllFrames(heroScrubber, heroPriority, cfg.heroFrameCount, 6);
+      streamAllFrames(dismantleScrubber, dismantlePriority, cfg.dismantleFrameCount, 6);
     }, 320);
 
     // ------------------------------------------------------------------------
@@ -347,7 +412,6 @@
         s.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
         s.setAttribute('data-cursor', isOpen ? 'CONFIGURE' : 'OPEN');
       });
-      // Update cursor label if mouse is over open slide
       const cursor = document.getElementById('cursor');
       if (cursor && cursor.classList.contains('is-hovered')) {
         const lbl = cursor.querySelector('.cursor-label');
@@ -372,7 +436,7 @@
       });
     });
 
-    // Swatch selection inside slides
+    // Swatches selection
     accordion.addEventListener('click', (e) => {
       const swatch = e.target.closest('.swatch');
       if (!swatch) return;
@@ -381,7 +445,7 @@
       swatch.classList.add('is-active');
     });
 
-    // Lineup entrance intersection observer (stagger 0.08s)
+    // Lineup entrance intersection observer
     const lineupSection = document.getElementById('lineup');
     const lineupObserver = new IntersectionObserver((entries) => {
       entries.forEach((entry) => {
@@ -431,7 +495,7 @@
         }
       });
 
-      // Speed & distance meters
+      // Speed & distance telemetry
       const speed = Math.round(heroP * cfg.hud.maxSpeed);
       const dist = (heroP * cfg.hud.maxDistance).toFixed(1);
       if (hudSpeed) hudSpeed.textContent = `${String(speed).padStart(3, '0')} KM/H`;
@@ -447,11 +511,15 @@
         }
       }
 
-      // 2. Statement word-by-word reveal
+      // 2. Statement word-by-word reveal (smooth illumination through viewport)
       const stmtEl = document.getElementById('statement');
       if (stmtEl) {
         const stmtRect = stmtEl.getBoundingClientRect();
-        const stmtP = Math.min(Math.max((window.innerHeight - stmtRect.top) / (window.innerHeight + stmtRect.height * 0.5), 0), 1);
+        const vh = window.innerHeight;
+        const startY = vh * 0.85;
+        const endY = vh * 0.20;
+        const rawP = (startY - stmtRect.top) / (startY - endY);
+        const stmtP = Math.min(Math.max(rawP, 0), 1);
         const activeWordCount = Math.floor(stmtP * wordSpans.length);
         wordSpans.forEach((w, i) => {
           w.style.opacity = i <= activeWordCount ? '1' : '0.15';
@@ -467,7 +535,7 @@
       }
       if (dismantleProgressLine) dismantleProgressLine.style.width = `${disP * 100}%`;
 
-      // Dismantle Callouts (> 70%)
+      // Dismantle Callouts (> 70% progress)
       cfg.dismantleCallouts.forEach((c) => {
         const item = document.getElementById(`callout-${c.id}`);
         if (item) item.classList.toggle('is-visible', disP >= c.revealAt);
@@ -479,7 +547,7 @@
     if (!prefersReduced) {
       requestAnimationFrame(tick);
     } else {
-      // Static reduced motion setup
+      // Reduced motion fallback
       heroScrubber.draw(0);
       dismantleScrubber.draw(0);
       wordSpans.forEach(w => w.style.opacity = '1');

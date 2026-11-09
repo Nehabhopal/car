@@ -32,6 +32,7 @@ html, body {
   font-size: 16px;
   line-height: 1.6;
   overflow-x: clip; /* Clean horizontal clip without breaking sticky stage */
+  scroll-behavior: smooth;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
